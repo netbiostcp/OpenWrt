@@ -1,184 +1,240 @@
-name: X86_64 OpenWrt
+name: Build OpenWrt Firmware
 
 on:
+  # 允许手动从 GitHub Actions 界面触发工作流
   workflow_dispatch:
+
+  # 每周日 UTC 时间 00:00 自动触发编译
   schedule:
-    - cron: 0 19 * * *
+    - cron: '0 0 * * 0'
+
+  # (可选) 当代码推送到 'main' 或 'master' 分支时自动触发
+  # 如果你频繁修改代码，这可能会导致大量构建
+  # push:
+  #   branches:
+  #     - main
+  #     - master
 
 env:
+  # OpenWrt 源码仓库 URL，这里使用的是 coolsnowwolf/lede
   REPO_URL: https://github.com/coolsnowwolf/lede
+  # OpenWrt 源码分支
   REPO_BRANCH: master
-  CONFIG_FILE: configs/x86_64.config
+  # 你的自定义 .config 文件名，位于你的 GitHub 仓库根目录
+  CONFIG_FILE: .config
+  # 你的自定义脚本文件，用于在编译前进行额外修改
   DIY_SCRIPT: diy-script.sh
-  CLASH_KERNEL: amd64
-  CACHE_TOOLCHAIN: true
-  UPLOAD_BIN_DIR: false
-  FIRMWARE_RELEASE: true
-  FIRMWARE_TAG: X86_64
+  # 时区设置，用于日志时间戳
   TZ: Asia/Shanghai
+
+  # --- 固件发布和缓存选项 ---
+  # 是否上传编译后的整个 'bin' 目录作为 GitHub Artifacts (通常只上传固件即可)
+  UPLOAD_BIN_DIR: false
+  # 是否创建 GitHub Release
+  FIRMWARE_RELEASE: true
+  # Release 的标签名，例如 'X86_64'
+  FIRMWARE_TAG: X86_64
+  # 是否使用缓存来加速编译 (推荐开启)
+  CACHE_TOOLCHAIN: true
+  # Clash 内核类型，如果你的 DIY_SCRIPT 中有相关配置
+  CLASH_KERNEL: amd64
 
 jobs:
   Build:
+    # 运行工作流的操作系统环境，推荐使用最新的 Ubuntu LTS
     runs-on: ubuntu-22.04
 
     steps:
-    - name: Check Server Performance
+    - name: 🚀 Free Disk Space (Optional but Recommended)
+      # 清理 GitHub Actions runner 上预装的不必要软件，以节省磁盘空间
+      # 对于大型编译项目（如 OpenWrt）非常有帮助
       run: |
-        echo "警告⚠"
-        echo "分配的服务器性能有限，若选择的插件过多，务必注意CPU性能！"
-        echo -e "已知CPU型号(降序): 7763，8370C，8272CL，8171M，E5-2673\n"
-        echo "--------------------------CPU信息--------------------------"
-        echo "CPU物理数量: $(cat /proc/cpuinfo | grep "physical id" | sort | uniq | wc -l)"
-        echo "CPU核心数量: $(nproc)"
-        echo -e "CPU型号信息:$(cat /proc/cpuinfo | grep -m1 name | awk -F: '{print $2}')\n"
-        echo "--------------------------内存信息--------------------------"
-        echo "已安装内存详细信息:"
-        echo -e "$(sudo lshw -short -C memory | grep GiB)\n"
-        echo "--------------------------硬盘信息--------------------------"
-        echo "硬盘数量: $(ls /dev/sd* | grep -v [1-9] | wc -l)" && df -hT
-
-    - name: Initialization Environment
-      env:
-        DEBIAN_FRONTEND: noninteractive
-      run: |
-        docker rmi $(docker images -q)
+        echo "::group::Freeing up disk space"
         sudo rm -rf /usr/share/dotnet /etc/apt/sources.list.d /usr/local/lib/android $AGENT_TOOLSDIRECTORY
         sudo -E apt-get -y purge azure-cli ghc* zulu* llvm* firefox google* dotnet* powershell openjdk* mongodb* moby* || true
-        sudo -E apt-get -y update
-        sudo -E apt-get -y install $(curl -fsSL is.gd/depends_ubuntu_2204)
-        sudo -E systemctl daemon-reload
         sudo -E apt-get -y autoremove --purge
         sudo -E apt-get -y clean
-        sudo timedatectl set-timezone "$TZ"
+        echo "::endgroup::"
+        df -h
 
-    - name: Combine Disks
-      uses: easimon/maximize-build-space@master
-      with:
-        swap-size-mb: 1024
-        temp-reserve-mb: 100
-        root-reserve-mb: 1024
-
-    - name: Checkout
-      uses: actions/checkout@main
-
-    - name: Clone Source Code
+    - name: 🔧 Install Build Dependencies
+      # 安装编译 OpenWrt 所需的系统依赖工具和库
+      # 这是最关键的步骤之一，确保所有必需的构建环境都可用
       run: |
-        df -hT $GITHUB_WORKSPACE
+        echo "::group::Installing build dependencies"
+        sudo -E apt-get update
+        sudo -E apt-get -y install build-essential git libncurses5-dev zlib1g-dev gawk flex unzip file wget \
+                                 libssl-dev python3 python3-distutils rsync subversion mercurial locales
+        sudo timedatectl set-timezone "$TZ" # 设置时区
+        echo "::endgroup::"
+
+    - name: 📥 Checkout Workflow Repository
+      # 克隆你的 GitHub 仓库，以便获取你上传的 .config 文件和 diy-script.sh
+      uses: actions/checkout@v4
+
+    - name: ⬇️ Clone OpenWrt Source Code
+      # 克隆指定分支的 OpenWrt 源码到 'openwrt' 目录
+      run: |
+        echo "::group::Cloning OpenWrt source"
         git clone $REPO_URL -b $REPO_BRANCH openwrt
         cd openwrt
+        # 将 OpenWrt 源码的绝对路径设置为环境变量，方便后续步骤引用
         echo "OPENWRT_PATH=$PWD" >> $GITHUB_ENV
-        COMMIT_AUTHOR=$(git show -s --date=short --format="作者: %an")
-        echo "COMMIT_AUTHOR=$COMMIT_AUTHOR" >> $GITHUB_ENV
-        COMMIT_DATE=$(git show -s --date=short --format="时间: %ci")
-        echo "COMMIT_DATE=$COMMIT_DATE" >> $GITHUB_ENV
-        COMMIT_MESSAGE=$(git show -s --date=short --format="内容: %s")
-        echo "COMMIT_MESSAGE=$COMMIT_MESSAGE" >> $GITHUB_ENV
-        COMMIT_HASH=$(git show -s --date=short --format="hash: %H")
-        echo "COMMIT_HASH=$COMMIT_HASH" >> $GITHUB_ENV
+        echo "::endgroup::"
+        # 记录一些 Git 信息，用于 Release 描述
+        echo "COMMIT_AUTHOR=$(git show -s --date=short --format="作者: %an")" >> $GITHUB_ENV
+        echo "COMMIT_DATE=$(git show -s --date=short --format="时间: %ci")" >> $GITHUB_ENV
+        echo "COMMIT_MESSAGE=$(git show -s --date=short --format="内容: %s")" >> $GITHUB_ENV
+        echo "COMMIT_HASH=$(git show -s --date=short --format="hash: %H")" >> $GITHUB_ENV
 
-    ---
-    # HERE IS THE KEY CHANGE
-    # Move the 'Install Feeds' step BEFORE 'Generate Variables'
-    ---
-    - name: Install Feeds
+    - name: ✨ Update and Install Feeds
+      # **这是关键步骤：** 更新和安装 OpenWrt 的软件包 feeds。
+      # 它会下载所有软件包的定义和构建规则（包括 Rust 相关的依赖），
+      # 必须在第一次 `make defconfig` 之前执行，确保编译环境完整。
       run: |
+        echo "::group::Updating and installing feeds"
         cd $OPENWRT_PATH
         ./scripts/feeds update -a
         ./scripts/feeds install -a
+        echo "::endgroup::"
 
-    - name: Generate Variables
+    - name: ⚙️ Prepare Configuration
+      # 准备 .config 文件，它是编译的核心配置文件。
+      # 1. 拷贝你的自定义 .config 文件到 OpenWrt 源码根目录。
+      # 2. 运行 `make defconfig` 来生成完整的配置，填补缺失的默认项。
       run: |
+        echo "::group::Preparing configuration"
         cp $CONFIG_FILE $OPENWRT_PATH/.config
         cd $OPENWRT_PATH
-        make defconfig > /dev/null 2>&1
+        make defconfig # 根据 .config 文件和 feeds 生成完整的配置
+        # 提取一些配置信息，用于后续命名和发布
         SOURCE_REPO="$(echo $REPO_URL | awk -F '/' '{print $(NF)}')"
         echo "SOURCE_REPO=$SOURCE_REPO" >> $GITHUB_ENV
         DEVICE_TARGET=$(cat .config | grep CONFIG_TARGET_BOARD | awk -F '"' '{print $2}')
         echo "DEVICE_TARGET=$DEVICE_TARGET" >> $GITHUB_ENV
         DEVICE_SUBTARGET=$(cat .config | grep CONFIG_TARGET_SUBTARGET | awk -F '"' '{print $2}')
         echo "DEVICE_SUBTARGET=$DEVICE_SUBTARGET" >> $GITHUB_ENV
+        echo "::endgroup::"
 
-    - name: Cache Toolchain
+    - name: ⚡ Cache Toolchain and DL (Optional)
+      # 缓存工具链和下载的软件包，显著加速后续编译。
+      # 使用 HiGarfield/cachewrtbuild 简化缓存逻辑。
       if: env.CACHE_TOOLCHAIN == 'true'
       uses: HiGarfield/cachewrtbuild@main
       with:
-        ccache: false
+        ccache: false # 是否缓存 ccache，根据需求开启
         mixkey: ${{ env.SOURCE_REPO }}-${{ env.REPO_BRANCH }}-${{ env.DEVICE_TARGET }}-${{ env.DEVICE_SUBTARGET }}
         prefix: ${{ env.OPENWRT_PATH }}
 
-    - name: Load Custom Configuration
+    - name: ➕ Apply Custom Modifications (DIY Script)
+      # 运行你的自定义脚本，进行额外的修改，例如：
+      # 添加自定义软件包、应用补丁、修改默认 IP 等。
       run: |
+        echo "::group::Applying custom modifications"
+        cd $OPENWRT_PATH
+        # 如果你的自定义文件或目录存在，可以移动它们
         [ -e files ] && mv files $OPENWRT_PATH/files
-        [ -e $CONFIG_FILE ] && mv $CONFIG_FILE $OPENWRT_PATH/.config
-        chmod +x $GITHUB_WORKSPACE/scripts/*.sh
-        chmod +x $DIY_SCRIPT
-        cd $OPENWRT_PATH
+        # 确保 DIY 脚本可执行
+        chmod +x $GITHUB_WORKSPACE/$DIY_SCRIPT
+        # 运行自定义脚本
         $GITHUB_WORKSPACE/$DIY_SCRIPT
-        $GITHUB_WORKSPACE/scripts/preset-clash-core.sh $CLASH_KERNEL
-        $GITHUB_WORKSPACE/scripts/preset-terminal-tools.sh
-        $GITHUB_WORKSPACE/scripts/preset-adguard-core.sh $CLASH_KERNEL
+        # 如果 DIY_SCRIPT 中有依赖其他脚本，确保它们也存在且可执行
+        # chmod +x $GITHUB_WORKSPACE/scripts/*.sh
+        # $GITHUB_WORKSPACE/scripts/preset-clash-core.sh $CLASH_KERNEL
+        # $GITHUB_WORKSPACE/scripts/preset-terminal-tools.sh
+        # $GITHUB_WORKSPACE/scripts/preset-adguard-core.sh $CLASH_KERNEL
+        echo "::endgroup::"
 
-    - name: Download DL Package
+    - name: 📦 Download all packages
+      # 下载所有编译所需的软件包源码。
+      # 提前下载可以避免编译过程中因网络问题导致的失败，并利用缓存。
       run: |
+        echo "::group::Downloading packages"
         cd $OPENWRT_PATH
-        make defconfig # This defconfig is for downloading packages, it's fine here
-        make download -j8
+        # 再次运行 defconfig 以确保所有自定义脚本修改的配置生效
+        make defconfig
+        # 下载所有源码包，-j$(nproc) 使用所有 CPU 核心并行下载
+        make download -j$(nproc)
+        # 清理下载目录中的不完整或损坏文件
         find dl -size -1024c -exec ls -l {} \;
         find dl -size -1024c -exec rm -f {} \;
+        echo "::endgroup::"
 
-    - name: Compile Firmware
-      id: compile
+    - name: 🛠️ Compile the Firmware
+      # 正式编译 OpenWrt 固件的核心步骤。
+      id: compile # 设置 ID，方便后续步骤引用其状态
       run: |
+        echo "::group::Compiling firmware"
         cd $OPENWRT_PATH
+        # 可选：添加一些初始设置脚本到固件中
         mkdir -p files/etc/uci-defaults
-        cp $GITHUB_WORKSPACE/scripts/init-settings.sh files/etc/uci-defaults/99-init-settings
-        echo -e "$(nproc) thread compile"
+        # cp $GITHUB_WORKSPACE/scripts/init-settings.sh files/etc/uci-defaults/99-init-settings
+
+        echo "Compiling with $(nproc) threads..."
+        # 尝试并行编译，如果失败则回退到单线程编译，再失败则回退到详细日志的单线程编译
         make -j$(nproc) || make -j1 || make -j1 V=s
+        echo "::endgroup::"
+        # 记录编译状态和日期，用于后续步骤
         echo "status=success" >> $GITHUB_OUTPUT
         echo "DATE=$(date +"%Y-%m-%d %H:%M:%S")" >> $GITHUB_ENV
         echo "FILE_DATE=$(date +"%Y.%m.%d")" >> $GITHUB_ENV
+        # 尝试从 manifests 文件中提取内核版本
+        echo "KERNEL=$(cat $OPENWRT_PATH/bin/targets/*/*/openwrt-*-kernel.bin.manifest 2>/dev/null | grep ^kernel | cut -d- -f2 | tr -d ' ')" >> $GITHUB_ENV
+        echo "FIRMWARE_PATH=$OPENWRT_PATH/bin/targets/${DEVICE_TARGET}/${DEVICE_SUBTARGET}" >> $GITHUB_ENV
 
-    - name: Check Space Usage
-      if: (!cancelled())
+
+    - name: 📊 Check Space Usage (Optional)
+      # 编译完成后检查磁盘空间使用情况
+      if: (!cancelled()) # 如果编译被取消，则不执行此步骤
       run: df -hT
 
-    - name: Upload Bin Directory
+    - name: 🗂️ Organize Files for Upload
+      # 整理编译后的文件，方便上传和发布。
+      if: steps.compile.outputs.status == 'success'
+      run: |
+        echo "::group::Organizing files"
+        cd $FIRMWARE_PATH # 进入固件目录
+        # 打印校验和
+        cat sha256sums
+        # 拷贝 .config 到固件目录
+        cp $OPENWRT_PATH/.config build.config
+        # 移动所有生成的 .ipk 包到 packages 子目录，并打包
+        mkdir -p packages
+        find $OPENWRT_PATH/bin/packages -name "*.ipk" -exec mv -f {} packages/ \;
+        tar -zcf Packages.tar.gz packages
+        # 清理一些不需要上传的文件
+        rm -rf packages feeds.buildinfo version.buildinfo
+        echo "::endgroup::"
+
+    - name: ⬆️ Upload Bin Directory (Optional)
+      # 如果需要，上传整个 bin 目录作为 GitHub Artifacts。
       if: steps.compile.outputs.status == 'success' && env.UPLOAD_BIN_DIR == 'true'
-      uses: actions/upload-artifact@main
+      uses: actions/upload-artifact@v4
       with:
         name: ${{ env.SOURCE_REPO }}-bin-${{ env.DEVICE_TARGET }}-${{ env.DEVICE_SUBTARGET }}-${{ env.FILE_DATE }}
         path: ${{ env.OPENWRT_PATH }}/bin
 
-    - name: Organize Files
-      if: steps.compile.outputs.status == 'success'
-      run: |
-        cd $OPENWRT_PATH/bin/targets/*/*
-        cat sha256sums
-        cp $OPENWRT_PATH/.config build.config
-        mv -f $OPENWRT_PATH/bin/packages/*/*/*.ipk packages
-        tar -zcf Packages.tar.gz packages
-        rm -rf packages feeds.buildinfo version.buildinfo
-        echo "KERNEL=$(cat *.manifest | grep ^kernel | cut -d- -f2 | tr -d ' ')" >> $GITHUB_ENV
-        echo "FIRMWARE_PATH=$PWD" >> $GITHUB_ENV
-
-    - name: Upload Firmware To Artifact
+    - name: 📤 Upload Firmware To Artifacts
+      # 上传固件到 GitHub Actions Artifacts (临时存储)，通常用于调试。
       if: steps.compile.outputs.status == 'success' && env.FIRMWARE_RELEASE != 'true'
-      uses: actions/upload-artifact@main
+      uses: actions/upload-artifact@v4
       with:
         name: ${{ env.SOURCE_REPO }}-firmware-${{ env.DEVICE_TARGET }}-${{ env.DEVICE_SUBTARGET }}-${{ env.FILE_DATE }}
-        path: ${{ env.FIRMWARE_PATH }}
+        path: ${{ env.FIRMWARE_PATH }}/* # 上传整个固件目录内容
 
-    - name: Upload Firmware To Release
+    - name: 📦 Create Release and Upload Firmware
+      # 创建 GitHub Release 并上传固件到 Release 页面。
       if: steps.compile.outputs.status == 'success' && env.FIRMWARE_RELEASE == 'true'
       uses: ncipollo/release-action@v1
       with:
         name: R${{ env.DATE }} for ${{ env.FIRMWARE_TAG }}
-        allowUpdates: true
-        tag: ${{ env.FIRMWARE_TAG }}
-        token: ${{ secrets.GITHUB_TOKEN }}
-        artifacts: ${{ env.FIRMWARE_PATH }}/*
-        body: |
+        allowUpdates: true # 允许更新同名 Release
+        tag: ${{ env.FIRMWARE_TAG }} # Release 的标签
+        token: ${{ secrets.GITHUB_TOKEN }} # GitHub 自动提供的 Token，用于发布 Release
+        artifacts: ${{ env.FIRMWARE_PATH }}/* # 上传固件目录下的所有文件
+        body: | # Release 的描述信息
           **This is OpenWrt Firmware for ${{ env.FIRMWARE_TAG }}**
+
           ### 📒 固件信息
           - 💻 平台架构: ${{ env.DEVICE_TARGET }}-${{ env.DEVICE_SUBTARGET }}
           - ⚽ 固件源码: ${{ env.REPO_URL }}
@@ -186,6 +242,7 @@ jobs:
           - 🚀 内核版本: ${{ env.KERNEL }}
           - 🌐 默认地址: 192.168.1.1
           - 🔑 默认密码: password
+
           ### 🧊 固件版本
           - 固件编译前最后一次➦[主源码](${{ env.REPO_URL }})更新记录
           - ${{ env.COMMIT_AUTHOR }}
